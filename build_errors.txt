@@ -1,0 +1,24 @@
+﻿cargo : error: failed to select a version for `we
+brtc`.
+所在位置 行:1 字符: 1
++ cargo check 2>&1 | Out-File -Encoding utf8 buil
+d_errors.txt
++ ~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (err 
+   or: failed t...n for `webrtc`.:String) [], R  
+  emoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+    ... required by package `PiHub v0.1.0 (H:\VSC
+odeWork\PiHub)`
+versions that meet the requirements `^0.11` (lock
+ed to 0.11.0) are: 0.11.0
+
+package `PiHub` depends on `webrtc` with feature 
+`detach` but `webrtc` does not have that feature.
+ available features: openssl, pem, vendored-opens
+sl
+
+
+failed to select a version for `webrtc` which cou
+ld resolve this conflict

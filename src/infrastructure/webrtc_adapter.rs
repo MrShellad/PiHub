@@ -1,21 +1,21 @@
 use crate::domain::models::{AnswerCode, InviteCode};
 use crate::domain::ports::{IpcEmitterPort, P2pPort};
+use crate::infrastructure::network_bridge::NetworkBridge;
+use crate::infrastructure::signaling_client::{self, SignalEvent, SignalingSocket};
 use anyhow::{Context, Result};
-use base64::{engine::general_purpose, Engine as _};
+use base64::{Engine as _, engine::general_purpose};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use webrtc::api::APIBuilder;
-use webrtc::data_channel::data_channel_init::RTCDataChannelInit;
+use webrtc::api::setting_engine::SettingEngine;
 use webrtc::ice_transport::ice_server::RTCIceServer;
+use webrtc::peer_connection::RTCPeerConnection;
 use webrtc::peer_connection::configuration::RTCConfiguration;
 use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
-use webrtc::peer_connection::RTCPeerConnection;
 
 pub struct WebRtcEngine {
-    /// 内部状态：维持当前房间的 P2P 连接实例
     current_pc: Mutex<Option<Arc<RTCPeerConnection>>>,
-    /// 注入的通信端口：用于底层异步事件的向上抛出
     ipc_emitter: Arc<dyn IpcEmitterPort>,
 }
 
@@ -27,80 +27,181 @@ impl WebRtcEngine {
         }
     }
 
-    /// 内部方法：构建基础的 PeerConnection 并挂载事件监听
     async fn build_pc(&self) -> Result<Arc<RTCPeerConnection>> {
-        let api = APIBuilder::new().build();
+        let mut setting_engine = SettingEngine::default();
+        setting_engine.detach_data_channels();
+
+        let api = APIBuilder::new()
+            .with_setting_engine(setting_engine)
+            .build();
         let config = RTCConfiguration {
             ice_servers: vec![RTCIceServer {
-                urls: vec!["stun:stun.l.google.com:19302".to_string()], // TODO: 替换国内 STUN
+                urls: vec!["stun:stun.l.google.com:19302".to_owned()],
                 ..Default::default()
             }],
             ..Default::default()
         };
 
         let pc = Arc::new(api.new_peer_connection(config).await?);
-        let emitter_clone = Arc::clone(&self.ipc_emitter);
-
-        // 监听连接状态
-        pc.on_peer_connection_state_change(Box::new(move |s: RTCPeerConnectionState| {
-            let state_str = s.to_string();
-            let emitter = Arc::clone(&emitter_clone);
+        let emitter = Arc::clone(&self.ipc_emitter);
+        pc.on_peer_connection_state_change(Box::new(move |state: RTCPeerConnectionState| {
+            let emitter = Arc::clone(&emitter);
+            let state_text = state.to_string();
             Box::pin(async move {
-                emitter.send_log("INFO", &format!("📶 P2P 状态变更: {}", state_str));
-                if s == RTCPeerConnectionState::Connected {
-                    emitter.send_event("TUNNEL_READY", serde_json::json!({"status": "connected"}));
-                }
+                emitter.send_log(
+                    "INFO",
+                    &format!("[WebRTC] PeerConnection state: {state_text}"),
+                );
             })
         }));
 
         Ok(pc)
     }
+
+    async fn encode_local_description(pc: &Arc<RTCPeerConnection>) -> Result<String> {
+        let local_desc = pc
+            .local_description()
+            .await
+            .context("failed to get local SDP")?;
+        let json_sdp = serde_json::to_string(&local_desc)?;
+        Ok(general_purpose::STANDARD.encode(json_sdp))
+    }
+
+    async fn apply_answer_if_needed(pc: &Arc<RTCPeerConnection>, answer_b64: &str) -> Result<bool> {
+        if pc.remote_description().await.is_some() {
+            return Ok(false);
+        }
+
+        let answer_json = String::from_utf8(general_purpose::STANDARD.decode(answer_b64)?)?;
+        let answer_sdp: RTCSessionDescription = serde_json::from_str(&answer_json)?;
+        pc.set_remote_description(answer_sdp).await?;
+        Ok(true)
+    }
+
+    async fn listen_for_signaled_answer(
+        pc: Arc<RTCPeerConnection>,
+        mut socket: SignalingSocket,
+        ipc_emitter: Arc<dyn IpcEmitterPort>,
+    ) {
+        loop {
+            match signaling_client::recv_event(&mut socket).await {
+                Ok(SignalEvent::PlayerAnswer { answer }) => {
+                    match Self::apply_answer_if_needed(&pc, &answer).await {
+                        Ok(true) => ipc_emitter.send_log(
+                            "INFO",
+                            "[Signal] Received PLAYER_ANSWER and applied remote SDP",
+                        ),
+                        Ok(false) => ipc_emitter.send_log(
+                            "INFO",
+                            "[Signal] PLAYER_ANSWER arrived after remote SDP was already set",
+                        ),
+                        Err(err) => ipc_emitter.send_log(
+                            "ERROR",
+                            &format!("[Signal] Failed to apply PLAYER_ANSWER: {err}"),
+                        ),
+                    }
+                    break;
+                }
+                Ok(SignalEvent::Error { message }) => {
+                    ipc_emitter.send_log(
+                        "ERROR",
+                        &format!(
+                            "[Signal] Signaling server error while waiting for answer: {message}"
+                        ),
+                    );
+                    break;
+                }
+                Ok(other) => {
+                    ipc_emitter.send_log(
+                        "WARN",
+                        &format!("[Signal] Ignoring unexpected signaling event: {other:?}"),
+                    );
+                }
+                Err(err) => {
+                    ipc_emitter.send_log(
+                        "ERROR",
+                        &format!("[Signal] Signaling listener stopped: {err}"),
+                    );
+                    break;
+                }
+            }
+        }
+    }
 }
 
-// 真正实现 P2pPort 契约
 impl P2pPort for WebRtcEngine {
-    async fn create_offer(&self) -> Result<InviteCode> {
+    async fn create_offer(
+        &self,
+        target_mc_port: u16,
+        signaling_server: Option<String>,
+    ) -> Result<InviteCode> {
         let pc = self.build_pc().await?;
-        
-        // 房主必须主动创建 DataChannel 才能触发底层的网络通路
-        let _dc = pc.create_data_channel("mc_tcp_tunnel", Some(RTCDataChannelInit {
-            ordered: Some(true),
-            ..Default::default()
-        })).await?;
+
+        NetworkBridge::start_host_bridge(
+            Arc::clone(&pc),
+            Arc::clone(&self.ipc_emitter),
+            target_mc_port,
+        )
+        .await?;
 
         let offer = pc.create_offer(None).await?;
         pc.set_local_description(offer).await?;
 
-        // 阻塞等待本地所有候选网络路线收集完毕
         let mut gather_complete = pc.gathering_complete_promise().await;
         let _ = gather_complete.recv().await;
 
-        let local_desc = pc.local_description().await.context("获取 SDP 失败")?;
-        let json_sdp = serde_json::to_string(&local_desc)?;
-        let invite_b64 = general_purpose::STANDARD.encode(json_sdp);
+        let offer_b64 = Self::encode_local_description(&pc).await?;
+        let invite_code = if let Some(server) = signaling_server {
+            let mut socket = signaling_client::connect(&server).await?;
+            let room_id = signaling_client::create_room(&mut socket, offer_b64).await?;
 
-        // 保存状态
+            let listener_pc = Arc::clone(&pc);
+            let listener_emitter = Arc::clone(&self.ipc_emitter);
+            tokio::spawn(async move {
+                Self::listen_for_signaled_answer(listener_pc, socket, listener_emitter).await;
+            });
+
+            self.ipc_emitter.send_log(
+                "INFO",
+                &format!("[Signal] Room created on signaling server: {room_id}"),
+            );
+            InviteCode(room_id)
+        } else {
+            InviteCode(offer_b64)
+        };
+
         *self.current_pc.lock().await = Some(Arc::clone(&pc));
-
-        Ok(InviteCode(invite_b64))
+        Ok(invite_code)
     }
 
-    async fn generate_answer(&self, offer: &InviteCode) -> Result<AnswerCode> {
+    async fn generate_answer(
+        &self,
+        offer: &InviteCode,
+        local_proxy_port: u16,
+        signaling_server: Option<String>,
+    ) -> Result<AnswerCode> {
         let pc = self.build_pc().await?;
-        let emitter_clone = Arc::clone(&self.ipc_emitter);
 
-        // 客户端监听数据通道开启
-        pc.on_data_channel(Box::new(move |d| {
-            let label = d.label().to_owned();
-            let emitter = Arc::clone(&emitter_clone);
-            Box::pin(async move {
-                emitter.send_log("INFO", &format!("📦 数据通道开启: {}", label));
-                // TODO: 对接 TCP 本地代理端口流量
-            })
-        }));
+        let (offer_b64, mut signaling_socket) = if let Some(server) = signaling_server {
+            let mut socket = signaling_client::connect(&server).await?;
+            let offer_b64 = signaling_client::join_room(&mut socket, &offer.0).await?;
+            self.ipc_emitter.send_log(
+                "INFO",
+                &format!("[Signal] Loaded room {} from signaling server", offer.0),
+            );
+            (offer_b64, Some(socket))
+        } else {
+            (offer.0.clone(), None)
+        };
 
-        // 解析邀请码并设置远程描述
-        let offer_json = String::from_utf8(general_purpose::STANDARD.decode(&offer.0)?)?;
+        NetworkBridge::start_client_bridge(
+            Arc::clone(&pc),
+            Arc::clone(&self.ipc_emitter),
+            local_proxy_port,
+        )
+        .await?;
+
+        let offer_json = String::from_utf8(general_purpose::STANDARD.decode(&offer_b64)?)?;
         let offer_sdp: RTCSessionDescription = serde_json::from_str(&offer_json)?;
         pc.set_remote_description(offer_sdp).await?;
 
@@ -110,23 +211,34 @@ impl P2pPort for WebRtcEngine {
         let mut gather_complete = pc.gathering_complete_promise().await;
         let _ = gather_complete.recv().await;
 
-        let local_desc = pc.local_description().await.context("获取 SDP 失败")?;
-        let json_sdp = serde_json::to_string(&local_desc)?;
-        let answer_b64 = general_purpose::STANDARD.encode(json_sdp);
+        let answer_b64 = Self::encode_local_description(&pc).await?;
+
+        if let Some(socket) = signaling_socket.as_mut() {
+            signaling_client::send_answer(socket, &offer.0, answer_b64.clone()).await?;
+            self.ipc_emitter.send_log(
+                "INFO",
+                &format!("[Signal] Sent answer back to signaling room {}", offer.0),
+            );
+        }
 
         *self.current_pc.lock().await = Some(Arc::clone(&pc));
-
         Ok(AnswerCode(answer_b64))
     }
 
     async fn accept_answer(&self, answer: &AnswerCode) -> Result<()> {
         let pc_guard = self.current_pc.lock().await;
-        let pc = pc_guard.as_ref().context("没有找到初始化好的 P2P 连接")?;
+        let pc = pc_guard
+            .as_ref()
+            .context("no active peer connection for accept_answer")?;
 
-        let answer_json = String::from_utf8(general_purpose::STANDARD.decode(&answer.0)?)?;
-        let answer_sdp: RTCSessionDescription = serde_json::from_str(&answer_json)?;
-        
-        pc.set_remote_description(answer_sdp).await?;
+        let applied = Self::apply_answer_if_needed(pc, &answer.0).await?;
+        if !applied {
+            self.ipc_emitter.send_log(
+                "INFO",
+                "[WebRTC] Remote answer already applied, skipping duplicate HOST_ACCEPT_ANSWER",
+            );
+        }
+
         Ok(())
     }
 }

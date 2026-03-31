@@ -34,15 +34,16 @@ enum RpcOutput<'a> {
         data: serde_json::Value,
     },
     #[serde(rename = "log")]
-    Log {
-        level: &'a str,
-        message: &'a str,
-    },
+    Log { level: &'a str, message: &'a str },
 }
 
 impl IpcEmitterPort for StdioEmitter {
     fn send_response(&self, req_id: &str, status: &str, data: serde_json::Value) {
-        self.emit(&RpcOutput::Response { req_id, status, data });
+        self.emit(&RpcOutput::Response {
+            req_id,
+            status,
+            data,
+        });
     }
 
     fn send_event(&self, event_name: &str, data: serde_json::Value) {
