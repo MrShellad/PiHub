@@ -9,13 +9,19 @@ pub type SignalingSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 #[derive(Serialize)]
 #[serde(tag = "action")]
-enum SignalRequest {
+pub enum SignalRequest {
     #[serde(rename = "CREATE_ROOM")]
-    CreateRoom { offer: String },
+    CreateRoom,
     #[serde(rename = "JOIN_ROOM")]
     JoinRoom { room_id: String },
+    #[serde(rename = "SEND_OFFER")]
+    SendOffer { room_id: String, target_id: String, offer: String },
     #[serde(rename = "SEND_ANSWER")]
-    SendAnswer { room_id: String, answer: String },
+    SendAnswer { room_id: String, target_id: String, answer: String },
+    #[serde(rename = "SEND_ICE_CANDIDATE")]
+    SendIceCandidate { room_id: String, target_id: String, candidate: String },
+    #[serde(rename = "LEAVE_ROOM")]
+    LeaveRoom { room_id: String },
 }
 
 #[derive(Debug, Deserialize)]
@@ -23,10 +29,16 @@ enum SignalRequest {
 pub enum SignalEvent {
     #[serde(rename = "ROOM_CREATED")]
     RoomCreated { room_id: String },
+    #[serde(rename = "PEER_JOINED")]
+    PeerJoined { client_id: String },
+    #[serde(rename = "PEER_LEFT")]
+    PeerLeft { client_id: String },
     #[serde(rename = "ROOM_OFFER")]
-    RoomOffer { offer: String },
+    RoomOffer { from_id: String, offer: String },
     #[serde(rename = "PLAYER_ANSWER")]
-    PlayerAnswer { answer: String },
+    PlayerAnswer { from_id: String, answer: String },
+    #[serde(rename = "ICE_CANDIDATE")]
+    IceCandidate { from_id: String, candidate: String },
     #[serde(rename = "ERROR")]
     Error { message: String },
 }
@@ -39,8 +51,8 @@ pub async fn connect(server: &str) -> Result<SignalingSocket> {
     Ok(socket)
 }
 
-pub async fn create_room(socket: &mut SignalingSocket, offer: String) -> Result<String> {
-    send_request(socket, SignalRequest::CreateRoom { offer }).await?;
+pub async fn create_room(socket: &mut SignalingSocket) -> Result<String> {
+    send_request(socket, SignalRequest::CreateRoom).await?;
     match recv_event(socket).await? {
         SignalEvent::RoomCreated { room_id } => Ok(room_id),
         SignalEvent::Error { message } => bail!("signaling server error: {message}"),
@@ -48,35 +60,22 @@ pub async fn create_room(socket: &mut SignalingSocket, offer: String) -> Result<
     }
 }
 
-pub async fn join_room(socket: &mut SignalingSocket, room_id: &str) -> Result<String> {
+pub async fn join_room(socket: &mut SignalingSocket, room_id: &str) -> Result<()> {
     send_request(
         socket,
         SignalRequest::JoinRoom {
             room_id: room_id.to_owned(),
         },
     )
-    .await?;
-
-    match recv_event(socket).await? {
-        SignalEvent::RoomOffer { offer } => Ok(offer),
-        SignalEvent::Error { message } => bail!("signaling server error: {message}"),
-        event => bail!("unexpected signaling event while joining room: {event:?}"),
-    }
+    .await
 }
 
-pub async fn send_answer(
-    socket: &mut SignalingSocket,
-    room_id: &str,
-    answer: String,
-) -> Result<()> {
-    send_request(
-        socket,
-        SignalRequest::SendAnswer {
-            room_id: room_id.to_owned(),
-            answer,
-        },
-    )
-    .await
+pub async fn send_request(socket: &mut SignalingSocket, request: SignalRequest) -> Result<()> {
+    let payload = serde_json::to_string(&request).context("failed to encode signaling request")?;
+    socket
+        .send(Message::Text(payload.into()))
+        .await
+        .context("failed to send signaling request")
 }
 
 pub async fn recv_event(socket: &mut SignalingSocket) -> Result<SignalEvent> {
@@ -100,14 +99,6 @@ pub async fn recv_event(socket: &mut SignalingSocket) -> Result<SignalEvent> {
             Message::Binary(_) | Message::Pong(_) | Message::Frame(_) => {}
         }
     }
-}
-
-async fn send_request(socket: &mut SignalingSocket, request: SignalRequest) -> Result<()> {
-    let payload = serde_json::to_string(&request).context("failed to encode signaling request")?;
-    socket
-        .send(Message::Text(payload.into()))
-        .await
-        .context("failed to send signaling request")
 }
 
 fn normalize_signaling_url(server: &str) -> Result<String> {

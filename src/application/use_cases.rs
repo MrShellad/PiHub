@@ -111,4 +111,13 @@ impl<P: P2pPort, I: IpcEmitterPort> SessionManager<P, I> {
             }
         }
     }
+
+    pub async fn handle_get_signaling_servers(&self, req_id: String) {
+        self.ipc_emitter
+            .send_log("INFO", "Received GET_SIGNALING_SERVERS request");
+
+        let config = crate::env::SignalingEnvConfig::get_config().await;
+        // Just serialize the whole thing and send it over IPC
+        self.ipc_emitter.send_response(&req_id, "success", serde_json::to_value(config).unwrap());
+    }
 }

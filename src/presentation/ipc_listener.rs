@@ -75,6 +75,9 @@ pub async fn start_event_loop<P: P2pPort + 'static, I: IpcEmitterPort + 'static>
                                 .await;
                         }
                     }
+                    "GET_SIGNALING_SERVERS" => {
+                        app_clone.handle_get_signaling_servers(req.req_id).await;
+                    }
                     _ => {}
                 }
             });

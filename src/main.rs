@@ -1,5 +1,6 @@
 mod application;
 mod domain;
+mod env;
 mod infrastructure;
 mod presentation;
 
